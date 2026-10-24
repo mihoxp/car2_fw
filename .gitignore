@@ -1,0 +1,5 @@
+# Build output
+build_pico_w/
+build_pico2_w/
+# WiFi password and agent IP: copy wifi_config.example.h to wifi_config.h
+wifi_config.h

@@ -1,0 +1,4 @@
+PRIMARY_SERVICE, GAP_SERVICE
+CHARACTERISTIC, GAP_DEVICE_NAME, READ, "pico_car2"
+
+#import <nordic_spp_service.gatt>
