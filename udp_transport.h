@@ -8,6 +8,12 @@
 
 bool wifi_connect(void);
 
+// Leave the current network so the next wifi_connect() tries the other one
+void wifi_switch_network(void);
+
+// SSID in use (or being tried)
+const char *wifi_ssid(void);
+
 // Current IPv4 address as text, or NULL when WiFi is down
 const char *wifi_ip_str(void);
 

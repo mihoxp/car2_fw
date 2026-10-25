@@ -19,6 +19,22 @@ static struct udp_pcb *pcb;
 static ip_addr_t agent_addr;
 static bool wifi_initialized;
 
+// Home WiFi first; the Pi's hotspot (only up while the Pi lost home WiFi) second
+struct wifi_net {
+    const char *ssid;
+    const char *password;
+    uint32_t timeout_ms;
+};
+static const struct wifi_net wifi_nets[] = {
+    { WIFI_SSID, WIFI_PASSWORD, 30000 },
+#ifdef WIFI_AP_SSID
+    // Usually absent: give up sooner
+    { WIFI_AP_SSID, WIFI_AP_PASSWORD, 10000 },
+#endif
+};
+#define WIFI_NET_COUNT (sizeof(wifi_nets) / sizeof(wifi_nets[0]))
+static unsigned wifi_idx;
+
 // Single-producer (lwIP callback) / single-consumer (read) packet queue
 static uint8_t rx_buf[RX_SLOTS][RX_SLOT_LEN];
 static uint16_t rx_len[RX_SLOTS];
@@ -70,14 +86,33 @@ bool wifi_connect(void)
     if (cyw43_tcpip_link_status(&cyw43_state, CYW43_ITF_STA) == CYW43_LINK_UP) {
         return true;
     }
-    printf("[wifi] connecting to %s ...\n", WIFI_SSID);
-    if (cyw43_arch_wifi_connect_timeout_ms(WIFI_SSID, WIFI_PASSWORD,
-                                           CYW43_AUTH_WPA2_AES_PSK, 30000)) {
+    const struct wifi_net *net = &wifi_nets[wifi_idx];
+    printf("[wifi] connecting to %s ...\n", net->ssid);
+    if (cyw43_arch_wifi_connect_timeout_ms(net->ssid, net->password,
+                                           CYW43_AUTH_WPA2_AES_PSK, net->timeout_ms)) {
         printf("[wifi] connect failed\n");
+        // Try the other network next time
+        wifi_idx = (wifi_idx + 1) % WIFI_NET_COUNT;
         return false;
     }
     printf("[wifi] connected, ip: %s\n", ip4addr_ntoa(netif_ip4_addr(netif_list)));
     return true;
+}
+
+void wifi_switch_network(void)
+{
+    if (WIFI_NET_COUNT < 2 || !wifi_initialized) {
+        return;
+    }
+    printf("[wifi] agent not reachable on %s, switching network\n",
+           wifi_nets[wifi_idx].ssid);
+    cyw43_wifi_leave(&cyw43_state, CYW43_ITF_STA);
+    wifi_idx = (wifi_idx + 1) % WIFI_NET_COUNT;
+}
+
+const char *wifi_ssid(void)
+{
+    return wifi_nets[wifi_idx].ssid;
 }
 
 const char *wifi_ip_str(void)

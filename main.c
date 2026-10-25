@@ -89,6 +89,9 @@ static const uint LINE_PINS[4] = {3, 2, 5, 4};
 #define FOLLOW_LIGHT_ON   18000
 #define FOLLOW_LIGHT_OFF  15000
 
+// How long to look for the agent on one WiFi network before trying the other
+#define AGENT_SEARCH_MS 20000
+
 enum agent_state { WAITING_AGENT, AGENT_AVAILABLE, AGENT_CONNECTED, AGENT_DISCONNECTED };
 
 #define OLED_PERIOD_MS 1000
@@ -857,7 +860,8 @@ static void oled_update(enum agent_state state)
     const char *ip = wifi_ip_str();
     ssd1306_clear();
     if (ip == NULL) {
-        ssd1306_text(0, "WIFI CONNECTING");
+        snprintf(line, sizeof(line), "WIFI %s", wifi_ssid());
+        ssd1306_text(0, line);
     } else if (strlen(ip) <= 13) {
         snprintf(line, sizeof(line), "IP %s", ip);
         ssd1306_text(0, line);
@@ -1234,6 +1238,7 @@ int main(void)
 
     enum agent_state state = WAITING_AGENT;
     absolute_time_t retry_at = get_absolute_time();
+    absolute_time_t switch_net_at = make_timeout_time_ms(AGENT_SEARCH_MS);
     int missed_pings = 0;
     absolute_time_t next_ping = get_absolute_time();
     absolute_time_t next_oled = get_absolute_time();
@@ -1252,6 +1257,14 @@ int main(void)
             if (rmw_uros_ping_agent(500, 1) == RMW_RET_OK) {
                 state = AGENT_AVAILABLE;
             } else {
+                if (wifi_ip_str() == NULL) {
+                    switch_net_at = make_timeout_time_ms(AGENT_SEARCH_MS);
+                } else if (time_reached(switch_net_at)) {
+                    // WiFi is up but the agent is not there: the Pi may have
+                    // fallen back to its own hotspot, or come back home
+                    wifi_switch_network();
+                    switch_net_at = make_timeout_time_ms(AGENT_SEARCH_MS);
+                }
                 wifi_connect();
                 sleep_ms(500);
             }
@@ -1297,6 +1310,7 @@ int main(void)
             cmd_angular = 0;
             destroy_entities();
             state = WAITING_AGENT;
+            switch_net_at = make_timeout_time_ms(AGENT_SEARCH_MS);
             break;
         }
 
