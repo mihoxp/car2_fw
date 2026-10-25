@@ -197,6 +197,11 @@ static bool too_close;
 static int far_count;
 static bool oled_dirty;
 
+static bool range_valid(float d)
+{
+    return d > 0 && d <= 4.0f;
+}
+
 // Called once per new ultrasonic reading. Turns on at once, but clears only
 // after several far readings so a single bad echo does not drop the warning.
 static void warning_update(float d)
@@ -330,6 +335,41 @@ static void pwm_debug(void)
 static bool ir_driving;     // the current drive command came from the IR remote
 static absolute_time_t ir_hold_until;
 
+// Too-close auto stop for every manual drive source (phone, HOTRC, IR, cmd_vel):
+// no forward motion while an obstacle is within the stopping distance. Same
+// numbers as the Pi's car2_safety node, floor tested 2026-10-25: any non-zero
+// speed runs the motors at 60-100% duty, so the distance follows that duty,
+// 20 cm up to 70% and 25 cm at 100%. A blocked command that also turns is
+// stopped as a whole, since a fast turn still swings the nose into the wall;
+// reversing and turning on the spot still work.
+#define GUARD_BASE_M     0.15f
+#define GUARD_COAST_M    0.10f   // extra distance at 100% duty
+#define GUARD_MIN_M      0.20f
+#define GUARD_RELEASE_M  0.05f   // must be this much farther for NEAR_CLEAR_COUNT readings
+
+static bool fwd_blocked;
+static float guard_release_m;
+static int guard_clear_count;
+
+static float guard_stop_m(float linear)
+{
+    if (linear <= 0.01f) {
+        return GUARD_MIN_M;
+    }
+    float speed = fminf(linear / MAX_WHEEL_SPEED_MPS, 1.0f);
+    float duty = MOTOR_MIN_DUTY + (1.0f - MOTOR_MIN_DUTY) * speed;
+    return fmaxf(GUARD_BASE_M + GUARD_COAST_M * duty * duty, GUARD_MIN_M);
+}
+
+static void guard_block(float d, float stop)
+{
+    fwd_blocked = true;
+    guard_release_m = stop + GUARD_RELEASE_M;
+    guard_clear_count = 0;
+    printf("guard: obstacle at %.3f m < %.2f m, forward blocked\n", d, stop);
+    buzzer_beep(1500, 150);
+}
+
 static void drive_cmd(float linear, float angular)
 {
     if (mode != MODE_MANUAL) {
@@ -339,6 +379,16 @@ static void drive_cmd(float linear, float angular)
         oled_dirty = true;
     }
     ir_driving = false;     // any other drive command takes over from the IR remote
+    if (linear > 0.01f) {
+        float stop = guard_stop_m(linear);
+        if (!fwd_blocked && range_valid(last_range_m) && last_range_m < stop) {
+            guard_block(last_range_m, stop);
+        }
+        if (fwd_blocked) {
+            linear = 0;
+            angular = 0;
+        }
+    }
     motors_drive(linear, angular);
 #if PWM_DEBUG
     static uint count;
@@ -356,6 +406,27 @@ static void drive_cmd(float linear, float angular)
     moving = true;
     led_on = !led_on;
     cyw43_arch_gpio_put(CYW43_WL_GPIO_LED_PIN, led_on);
+}
+
+// Called once per new ultrasonic reading: stops a forward-moving car at the
+// stopping distance, and releases after NEAR_CLEAR_COUNT farther readings
+// (no echo counts as far, like the warning: open space returns nothing).
+static void guard_update(float d)
+{
+    if (fwd_blocked) {
+        guard_clear_count = (!range_valid(d) || d > guard_release_m) ? guard_clear_count + 1 : 0;
+        if (guard_clear_count >= NEAR_CLEAR_COUNT) {
+            fwd_blocked = false;
+            printf("guard: clear (%.3f m), forward allowed\n", d);
+        }
+    } else if (mode == MODE_MANUAL && cmd_linear > 0.01f && range_valid(d) &&
+               d < guard_stop_m(cmd_linear)) {
+        guard_block(d, guard_stop_m(cmd_linear));
+        motors_drive(0, 0);
+        cmd_linear = 0;
+        cmd_angular = 0;
+        brake_until = make_timeout_time_ms(BRAKE_MS);
+    }
 }
 
 static void cmd_vel_cb(const void *msgin)
@@ -578,9 +649,8 @@ static void range_timer_cb(rcl_timer_t *timer, int64_t last_call_time)
     if (timer == NULL) {
         return;
     }
-    float d = ultrasonic_read_m();
-    last_range_m = d;
-    warning_update(d);
+    // The main loop takes the readings, so they keep going without the agent
+    float d = last_range_m;
     int64_t now_ns = rmw_uros_epoch_nanos();
     range_msg.header.stamp.sec = now_ns / 1000000000;
     range_msg.header.stamp.nanosec = now_ns % 1000000000;
@@ -701,10 +771,6 @@ static void mode_cb(const void *msgin)
     set_mode(m->data.data ? m->data.data : "");
 }
 
-static bool range_valid(float d)
-{
-    return d > 0 && d <= 4.0f;
-}
 
 // Non-blocking version of YAHBOOM's loop so ROS, the OLED and the safety
 // checks keep running while the car backs up and turns.
@@ -876,12 +942,7 @@ static void oled_update(enum agent_state state)
                     mode == MODE_LIGHT_FOLLOW ? "ROS OK  FOLLOW" :
                     mode == MODE_LINE_TRACK ? "ROS OK  TRACK" :
                     mode == MODE_AVOID ? "ROS OK  AVOID" : "ROS OK");
-    // Reuse the range timer's reading while connected, so two pings never overlap
-    float d = state == AGENT_CONNECTED ? last_range_m : ultrasonic_read_m();
-    if (state != AGENT_CONNECTED) {
-        last_range_m = d;
-        warning_update(d);
-    }
+    float d = last_range_m;   // read by the main loop
     if (d < 0 || d > range_msg.max_range) {
         snprintf(line, sizeof(line), "DIST ---");
     } else {
@@ -1246,6 +1307,7 @@ int main(void)
     absolute_time_t next_follow = get_absolute_time();
     absolute_time_t next_track = get_absolute_time();
     absolute_time_t next_avoid = get_absolute_time();
+    absolute_time_t next_range = get_absolute_time();
     last_cmd_time = get_absolute_time();
 
     while (true) {
@@ -1337,6 +1399,16 @@ int main(void)
             printf("sbus: %lu frames, %lu errors\n", (unsigned long)sbus_frames(),
                    (unsigned long)sbus_errors());
         }
+        // Ultrasonic every RANGE_PERIOD_MS with or without the agent: the
+        // too-close stop must also work for the phone and HOTRC on their own
+        if (time_reached(next_range)) {
+            next_range = make_timeout_time_ms(RANGE_PERIOD_MS);
+            float d = ultrasonic_read_m();
+            last_range_m = d;
+            warning_update(d);
+            guard_update(d);
+        }
+
         ir_drive_update();
         sbus_update();
         uint8_t ir_cmd;
